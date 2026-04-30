@@ -1,14 +1,44 @@
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'dart:async';
 import 'dart:convert';
+import 'firebase_options.dart';
+import 'services/auth_service.dart';
+import 'services/esp32_data_service.dart';
+import 'services/notification_service.dart';
+import 'services/firestore_service.dart';
+import 'screens/login_screen.dart';
+import 'screens/enhanced_signup_screen.dart';
+import 'screens/analytics_dashboard_screen.dart';
+import 'screens/history_reports_screen.dart';
+import 'screens/user_profile_screen.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
+  // Initialize notification service safely - don't crash app if it fails
+  try {
+    await NotificationService().initialize();
+  } catch (e) {
+    print('⚠️ Notification init failed: $e');
+  }
+
   runApp(const ForestFireApp());
 }
 
-class ForestFireApp extends StatelessWidget {
+class ForestFireApp extends StatefulWidget {
   const ForestFireApp({super.key});
+
+  @override
+  State<ForestFireApp> createState() => _ForestFireAppState();
+}
+
+class _ForestFireAppState extends State<ForestFireApp> {
+  bool _showSignUp = false;
+  final AuthService _authService = AuthService();
 
   @override
   Widget build(BuildContext context) {
@@ -22,7 +52,38 @@ class ForestFireApp extends StatelessWidget {
           brightness: Brightness.light,
         ),
       ),
-      home: const ForestFireMonitorScreen(),
+      home: StreamBuilder<User?>(
+        stream: _authService.userStream,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Scaffold(
+              body: Center(child: CircularProgressIndicator()),
+            );
+          }
+
+          // User is logged in
+          if (snapshot.hasData && snapshot.data != null) {
+            return const ForestFireMonitorScreen();
+          }
+
+          // User is not logged in
+          return _showSignUp
+              ? EnhancedSignupScreen(
+                  onSignInPressed: () {
+                    setState(() {
+                      _showSignUp = false;
+                    });
+                  },
+                )
+              : LoginScreen(
+                  onSignUpPressed: () {
+                    setState(() {
+                      _showSignUp = true;
+                    });
+                  },
+                );
+        },
+      ),
     );
   }
 }
@@ -91,6 +152,11 @@ class ForestFireMonitorScreen extends StatefulWidget {
 class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
     with TickerProviderStateMixin {
   late Timer _updateTimer;
+  late TabController _tabController;
+  final AuthService _authService = AuthService();
+  final NotificationService _notificationService = NotificationService();
+  final FirestoreService _firestoreService = FirestoreService();
+  late ESP32DataService _esp32DataService;
 
   /// Web server root (ESP32). JSON is loaded from `<this>/data`.
   /// Use the IP your ESP32 prints (e.g. phone on same Wi‑Fi: 10.148.x.x;
@@ -104,6 +170,7 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
   SensorData? currentData;
   List<double> temperatureHistory = [];
   List<double> humidityHistory = [];
+  List<int> smokeHistory = [];
 
   // Alert thresholds
   final double tempHighThreshold = 35;
@@ -127,14 +194,28 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: 3, vsync: this);
+    _esp32DataService = ESP32DataService(deviceBaseUrl: deviceBaseUrl);
     startDataUpdates();
     showIPConfigDialog();
+    // Send startup notification after a short delay
+    Future.delayed(const Duration(seconds: 2), _sendStartupNotification);
+  }
+
+  Future<void> _sendStartupNotification() async {
+    try {
+      if (currentData == null) {
+        await _notificationService.showSafeNotification();
+      }
+    } catch (e) {
+      print('⚠️ Startup notification failed: $e');
+    }
   }
 
   void showIPConfigDialog() {
     Future.delayed(const Duration(milliseconds: 500), () {
       if (!mounted) return;
-      
+
       showDialog(
         context: context,
         barrierDismissible: false,
@@ -190,18 +271,30 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
         fetchSensorData();
       }
     });
+    // Also trigger enhanced data fetch via ESP32DataService for Firestore storage
+    Timer.periodic(const Duration(seconds: 10), (_) {
+      if (mounted) {
+        try {
+          _esp32DataService.fetchEnhancedSensorData();
+        } catch (e) {
+          print('⚠️ ESP32 Firestore save failed: $e');
+        }
+      }
+    });
   }
 
   Future<void> fetchSensorData() async {
     try {
       final url = _sensorsApiUri;
 
-      final response = await http.get(url).timeout(
-        const Duration(seconds: 5),
-        onTimeout: () {
-          throw Exception('Connection timeout');
-        },
-      );
+      final response = await http
+          .get(url)
+          .timeout(
+            const Duration(seconds: 5),
+            onTimeout: () {
+              throw Exception('Connection timeout');
+            },
+          );
 
       if (response.statusCode == 200) {
         final body = response.body.trim();
@@ -226,15 +319,20 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
             errorMessage = "";
 
             // Add to history
-            if (temperatureHistory.length >= 20) {
+            if (temperatureHistory.length >= 50) {
               temperatureHistory.removeAt(0);
             }
             temperatureHistory.add(data.temperature);
 
-            if (humidityHistory.length >= 20) {
+            if (humidityHistory.length >= 50) {
               humidityHistory.removeAt(0);
             }
             humidityHistory.add(data.humidity);
+
+            if (smokeHistory.length >= 50) {
+              smokeHistory.removeAt(0);
+            }
+            smokeHistory.add(data.smokeLevel);
 
             _checkAlerts(data);
           });
@@ -262,6 +360,20 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
   }
 
   void _checkAlerts(SensorData data) {
+    // Calculate a simple risk score for notification
+    double riskScore = 0;
+    if (data.smokeDetected) riskScore += 50;
+    if (data.temperature > tempHighThreshold) riskScore += 30;
+    if (data.temperature > 45) riskScore += 20;
+
+    // Send push notification based on risk (safely)
+    try {
+      _notificationService.showRiskNotification(riskScore);
+    } catch (e) {
+      print('⚠️ Notification failed: $e');
+    }
+
+    // Show in-app snackbar alerts
     if (data.temperature > tempHighThreshold) {
       _showAlert(
         'Temperature Alert',
@@ -284,6 +396,24 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
         '🔴 Smoke Detected: ${data.smokeLevel}',
         Colors.red,
       );
+      // Save fire alert to Firestore (safely)
+      try {
+        _firestoreService.saveFireAlert(
+          riskScore: riskScore,
+          riskLevel: riskScore >= 80
+              ? 'Critical Risk'
+              : riskScore >= 60
+              ? 'Very High Risk'
+              : riskScore >= 40
+              ? 'High Risk'
+              : 'Moderate Risk',
+          temperature: data.temperature,
+          smokeLevel: data.smokeLevel,
+          deviceId: deviceBaseUrl,
+        );
+      } catch (e) {
+        print('⚠️ Firestore alert save failed: $e');
+      }
     }
   }
 
@@ -307,10 +437,7 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
                       fontSize: 14,
                     ),
                   ),
-                  Text(
-                    message,
-                    style: const TextStyle(fontSize: 12),
-                  ),
+                  Text(message, style: const TextStyle(fontSize: 12)),
                 ],
               ),
             ),
@@ -325,6 +452,7 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
   @override
   void dispose() {
     _updateTimer.cancel();
+    _tabController.dispose();
     super.dispose();
   }
 
@@ -357,15 +485,20 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
         foregroundColor: Colors.white,
         title: const Text(
           'Forest Fire Monitor',
-          style: TextStyle(
-            fontWeight: FontWeight.bold,
-            fontSize: 22,
-          ),
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 22),
         ),
         centerTitle: true,
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(icon: Icon(Icons.dashboard), text: 'Monitor'),
+            Tab(icon: Icon(Icons.analytics), text: 'Analytics'),
+            Tab(icon: Icon(Icons.history), text: 'History'),
+          ],
+        ),
         actions: [
           Padding(
-            padding: const EdgeInsets.all(16.0),
+            padding: const EdgeInsets.only(top: 8, bottom: 8),
             child: Center(
               child: Chip(
                 label: Text(
@@ -386,218 +519,267 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
               ),
             ),
           ),
+          IconButton(
+            icon: const Icon(Icons.person, color: Colors.white),
+            tooltip: 'Profile',
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => const UserProfileScreen(),
+                ),
+              );
+            },
+          ),
+          PopupMenuButton(
+            itemBuilder: (context) => [
+              PopupMenuItem(
+                child: const Row(
+                  children: [
+                    Icon(Icons.logout),
+                    SizedBox(width: 8),
+                    Text('Sign Out'),
+                  ],
+                ),
+                onTap: () async {
+                  try {
+                    await _authService.signOut();
+                  } catch (e) {
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Sign out failed: $e')),
+                      );
+                    }
+                  }
+                },
+              ),
+            ],
+          ),
         ],
       ),
-      body: RefreshIndicator(
-        onRefresh: () => fetchSensorData(),
-        child: SingleChildScrollView(
-          physics: const AlwaysScrollableScrollPhysics(),
-          child: Column(
-            children: [
-              // Status Header
-              Container(
-                width: double.infinity,
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [
-                      _getStatusColor(),
-                      _getStatusColor().withOpacity(0.7),
-                    ],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          // Monitor Tab - Real-time monitoring
+          _buildMonitoringScreen(),
+          // Analytics Tab - ML Predictions and Analytics
+          currentData == null
+              ? const Center(child: Text('Connect to device to view analytics'))
+              : AnalyticsDashboardScreen(
+                  temperature: currentData!.temperature,
+                  humidity: currentData!.humidity,
+                  smokeLevel: currentData!.smokeLevel,
+                  temperatureHistory: temperatureHistory,
+                  smokeHistory: smokeHistory,
                 ),
-                padding: const EdgeInsets.all(24),
+          // History Tab - Historical data from Firestore
+          const HistoryReportsScreen(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMonitoringScreen() {
+    return RefreshIndicator(
+      onRefresh: () => fetchSensorData(),
+      child: SingleChildScrollView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        child: Column(
+          children: [
+            // Status Header
+            Container(
+              width: double.infinity,
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [
+                    _getStatusColor(),
+                    _getStatusColor().withOpacity(0.7),
+                  ],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+              ),
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                children: [
+                  Text(
+                    _getStatusText(),
+                    style: const TextStyle(
+                      fontSize: 32,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  if (currentData == null)
+                    Text(
+                      errorMessage.isNotEmpty
+                          ? '❌ $errorMessage'
+                          : '⏳ Connecting to ESP32...',
+                      style: const TextStyle(
+                        fontSize: 14,
+                        color: Colors.white70,
+                      ),
+                    )
+                  else
+                    Text(
+                      currentData!.smokeDetected
+                          ? 'Smoke detected - Alert active'
+                          : currentData!.temperature > tempHighThreshold
+                          ? 'High temperature detected'
+                          : currentData!.temperature < tempLowThreshold
+                          ? 'Low temperature detected'
+                          : 'All systems normal',
+                      style: const TextStyle(
+                        fontSize: 14,
+                        color: Colors.white70,
+                      ),
+                    ),
+                  const SizedBox(height: 12),
+                  Text(
+                    'Server: ${_normalizedDeviceUri()}',
+                    style: const TextStyle(fontSize: 12, color: Colors.white60),
+                    textAlign: TextAlign.center,
+                  ),
+                  Text(
+                    'Fetch: $_sensorsApiUri',
+                    style: const TextStyle(fontSize: 11, color: Colors.white54),
+                    textAlign: TextAlign.center,
+                  ),
+                ],
+              ),
+            ),
+
+            if (currentData == null)
+              // No Data Screen
+              Padding(
+                padding: const EdgeInsets.all(32.0),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const SizedBox(height: 60),
+                    Icon(
+                      Icons.cloud_off_outlined,
+                      size: 80,
+                      color: Colors.grey[400],
+                    ),
+                    const SizedBox(height: 24),
+                    Text(
+                      errorMessage,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.grey[600],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      'Make sure:\n'
+                      '• ESP32 is connected to your WiFi hotspot\n'
+                      '• Server URL is correct: $deviceBaseUrl\n'
+                      '• Fetch URL: $_sensorsApiUri\n'
+                      '• Both devices are on same network\n'
+                      '• Pull down to refresh',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 13, color: Colors.grey[500]),
+                    ),
+                    const SizedBox(height: 24),
+                    ElevatedButton.icon(
+                      onPressed: () => showIPConfigDialog(),
+                      icon: const Icon(Icons.settings),
+                      label: const Text('Change server URL'),
+                    ),
+                    const SizedBox(height: 16),
+                    ElevatedButton.icon(
+                      onPressed: fetchSensorData,
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('Retry Connection'),
+                    ),
+                  ],
+                ),
+              )
+            else
+              // Data Display
+              Padding(
+                padding: const EdgeInsets.all(16),
                 child: Column(
                   children: [
-                    Text(
-                      _getStatusText(),
-                      style: const TextStyle(
-                        fontSize: 32,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white,
-                      ),
+                    // Temperature Card
+                    _buildSensorCard(
+                      icon: Icons.thermostat_outlined,
+                      title: 'Temperature',
+                      value: currentData!.temperature.toStringAsFixed(1),
+                      unit: '°C',
+                      color: currentData!.temperature > tempHighThreshold
+                          ? Colors.red
+                          : currentData!.temperature < tempLowThreshold
+                          ? Colors.blue
+                          : Colors.orange[700]!,
+                      range: '$tempLowThreshold°C - $tempHighThreshold°C',
                     ),
-                    const SizedBox(height: 8),
-                    if (currentData == null)
-                      Text(
-                        errorMessage.isNotEmpty
-                            ? '❌ $errorMessage'
-                            : '⏳ Connecting to ESP32...',
-                        style: const TextStyle(
-                          fontSize: 14,
-                          color: Colors.white70,
+                    const SizedBox(height: 16),
+
+                    // Humidity Card
+                    _buildSensorCard(
+                      icon: Icons.water_drop_outlined,
+                      title: 'Humidity',
+                      value: currentData!.humidity.toStringAsFixed(1),
+                      unit: '%',
+                      color: currentData!.humidity > humidityHighThreshold
+                          ? Colors.blue
+                          : currentData!.humidity < humidityLowThreshold
+                          ? Colors.orange[700]!
+                          : Colors.green,
+                      range: '$humidityLowThreshold% - $humidityHighThreshold%',
+                    ),
+                    const SizedBox(height: 16),
+
+                    // Smoke Level Card
+                    _buildSmokeCard(),
+                    const SizedBox(height: 16),
+
+                    // Statistics Cards
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _buildStatCard(
+                            label: 'Max Temp',
+                            value: (currentData!.temperature + 5)
+                                .toStringAsFixed(1),
+                            unit: '°C',
+                          ),
                         ),
-                      )
-                    else
-                      Text(
-                        currentData!.smokeDetected
-                            ? 'Smoke detected - Alert active'
-                            : currentData!.temperature > tempHighThreshold
-                                ? 'High temperature detected'
-                                : currentData!.temperature < tempLowThreshold
-                                    ? 'Low temperature detected'
-                                    : 'All systems normal',
-                        style: const TextStyle(
-                          fontSize: 14,
-                          color: Colors.white70,
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: _buildStatCard(
+                            label: 'Min Temp',
+                            value: (currentData!.temperature - 3)
+                                .toStringAsFixed(1),
+                            unit: '°C',
+                          ),
                         ),
-                      ),
+                      ],
+                    ),
                     const SizedBox(height: 12),
-                    Text(
-                      'Server: ${_normalizedDeviceUri()}',
-                      style: const TextStyle(
-                        fontSize: 12,
-                        color: Colors.white60,
+
+                    // System Info
+                    _buildInfoCard(),
+                    const SizedBox(height: 16),
+
+                    // IP Configuration Button
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        onPressed: showIPConfigDialog,
+                        icon: const Icon(Icons.router),
+                        label: const Text('Change server URL'),
                       ),
-                      textAlign: TextAlign.center,
-                    ),
-                    Text(
-                      'Fetch: $_sensorsApiUri',
-                      style: const TextStyle(
-                        fontSize: 11,
-                        color: Colors.white54,
-                      ),
-                      textAlign: TextAlign.center,
                     ),
                   ],
                 ),
               ),
-
-              if (currentData == null)
-                // No Data Screen
-                Padding(
-                  padding: const EdgeInsets.all(32.0),
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      const SizedBox(height: 60),
-                      Icon(
-                        Icons.cloud_off_outlined,
-                        size: 80,
-                        color: Colors.grey[400],
-                      ),
-                      const SizedBox(height: 24),
-                      Text(
-                        errorMessage,
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.grey[600],
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      Text(
-                        'Make sure:\n'
-                        '• ESP32 is connected to your WiFi hotspot\n'
-                        '• Server URL is correct: $deviceBaseUrl\n'
-                        '• Fetch URL: $_sensorsApiUri\n'
-                        '• Both devices are on same network\n'
-                        '• Pull down to refresh',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontSize: 13,
-                          color: Colors.grey[500],
-                        ),
-                      ),
-                      const SizedBox(height: 24),
-                      ElevatedButton.icon(
-                        onPressed: () => showIPConfigDialog(),
-                        icon: const Icon(Icons.settings),
-                        label: const Text('Change server URL'),
-                      ),
-                      const SizedBox(height: 16),
-                      ElevatedButton.icon(
-                        onPressed: fetchSensorData,
-                        icon: const Icon(Icons.refresh),
-                        label: const Text('Retry Connection'),
-                      ),
-                    ],
-                  ),
-                )
-              else
-                // Data Display
-                Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    children: [
-                      // Temperature Card
-                      _buildSensorCard(
-                        icon: Icons.thermostat_outlined,
-                        title: 'Temperature',
-                        value: currentData!.temperature.toStringAsFixed(1),
-                        unit: '°C',
-                        color: currentData!.temperature > tempHighThreshold
-                            ? Colors.red
-                            : currentData!.temperature < tempLowThreshold
-                                ? Colors.blue
-                                : Colors.orange[700]!,
-                        range: '$tempLowThreshold°C - $tempHighThreshold°C',
-                      ),
-                      const SizedBox(height: 16),
-
-                      // Humidity Card
-                      _buildSensorCard(
-                        icon: Icons.water_drop_outlined,
-                        title: 'Humidity',
-                        value: currentData!.humidity.toStringAsFixed(1),
-                        unit: '%',
-                        color: currentData!.humidity > humidityHighThreshold
-                            ? Colors.blue
-                            : currentData!.humidity < humidityLowThreshold
-                                ? Colors.orange[700]!
-                                : Colors.green,
-                        range: '$humidityLowThreshold% - $humidityHighThreshold%',
-                      ),
-                      const SizedBox(height: 16),
-
-                      // Smoke Level Card
-                      _buildSmokeCard(),
-                      const SizedBox(height: 16),
-
-                      // Statistics Cards
-                      Row(
-                        children: [
-                          Expanded(
-                            child: _buildStatCard(
-                              label: 'Max Temp',
-                              value: (currentData!.temperature + 5)
-                                  .toStringAsFixed(1),
-                              unit: '°C',
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: _buildStatCard(
-                              label: 'Min Temp',
-                              value: (currentData!.temperature - 3)
-                                  .toStringAsFixed(1),
-                              unit: '°C',
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-
-                      // System Info
-                      _buildInfoCard(),
-                      const SizedBox(height: 16),
-
-                      // IP Configuration Button
-                      SizedBox(
-                        width: double.infinity,
-                        child: ElevatedButton.icon(
-                          onPressed: showIPConfigDialog,
-                          icon: const Icon(Icons.router),
-                          label: const Text('Change server URL'),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-            ],
-          ),
+          ],
         ),
       ),
     );
@@ -634,11 +816,7 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
               color: color.withOpacity(0.1),
               shape: BoxShape.circle,
             ),
-            child: Icon(
-              icon,
-              color: color,
-              size: 36,
-            ),
+            child: Icon(icon, color: color, size: 36),
           ),
           const SizedBox(width: 16),
           Expanded(
@@ -680,10 +858,7 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
                 const SizedBox(height: 4),
                 Text(
                   'Normal: $range',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: Colors.grey[500],
-                  ),
+                  style: TextStyle(fontSize: 12, color: Colors.grey[500]),
                 ),
               ],
             ),
@@ -733,8 +908,7 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
                 ),
                 child: Icon(
                   Icons.cloud_outlined,
-                  color:
-                      currentData!.smokeDetected ? Colors.red : Colors.grey,
+                  color: currentData!.smokeDetected ? Colors.red : Colors.grey,
                   size: 36,
                 ),
               ),
@@ -780,8 +954,10 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
                 ),
               ),
               Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 6,
+                ),
                 decoration: BoxDecoration(
                   color: currentData!.smokeDetected ? Colors.red : Colors.green,
                   borderRadius: BorderRadius.circular(20),
@@ -815,10 +991,7 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
             children: [
               Text(
                 'Threshold: ${currentData!.threshold}',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Colors.grey[600],
-                ),
+                style: TextStyle(fontSize: 12, color: Colors.grey[600]),
               ),
               Text(
                 '${smokePercentage.toStringAsFixed(1)}%',
@@ -876,10 +1049,7 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
               const SizedBox(width: 2),
               Text(
                 unit,
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Colors.grey[600],
-                ),
+                style: TextStyle(fontSize: 12, color: Colors.grey[600]),
               ),
             ],
           ),
@@ -925,13 +1095,7 @@ class _ForestFireMonitorScreenState extends State<ForestFireMonitorScreen>
   Widget _buildInfoItem(String label, String value) {
     return Column(
       children: [
-        Text(
-          label,
-          style: TextStyle(
-            fontSize: 12,
-            color: Colors.grey[600],
-          ),
-        ),
+        Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
         const SizedBox(height: 4),
         Text(
           value,

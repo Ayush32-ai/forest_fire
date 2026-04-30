@@ -35,6 +35,13 @@ dependencies:
   intl: ^0.19.0
   google_fonts: ^6.1.0
   http: ^1.1.0
+  firebase_core: ^3.4.0
+  firebase_auth: ^5.2.0
+  google_sign_in: ^6.2.1
+  shared_preferences: ^2.5.3
+  flutter_secure_storage: ^10.0.0
+  cloud_firestore: ^5.6.12
+  flutter_local_notifications: ^20.1.0
 
 dev_dependencies:
   flutter_test:
